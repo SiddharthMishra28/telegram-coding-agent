@@ -121,7 +121,8 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     llm_with_tools = llm.bind_tools(tools)
 
     FINAL_INSTRUCTION = (
-        "\n\nAfter creating all files, send a final plain-text summary listing every file you created and its purpose."
+        "\n\nCRITICAL: You MUST end this turn with a plain-text summary message. "
+        "Do NOT continue calling tools forever. After your last tool call, provide a final summary."
     )
 
     def agent_node(state: AgentState):
@@ -161,20 +162,86 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     return graph.compile()
 
 
-def run_agent_checkpointed(system_prompt: str, workspace_dir: str, messages: list, checkpoint_path: str, max_steps: int = 200) -> dict:
+def _estimate_tokens(messages: list[BaseMessage]) -> int:
+    total = 0
+    for m in messages:
+        content = getattr(m, "content", "")
+        if isinstance(content, str):
+            total += len(content) // 4
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total += len(part.get("text", "")) // 4
+    return total
+
+
+def _compact_messages(messages: list[BaseMessage], max_tokens: int = 60000) -> list[BaseMessage]:
+    if _estimate_tokens(messages) <= max_tokens:
+        return messages
+
+    kept = []
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            kept.append(m)
+        elif isinstance(m, AIMessage) and not m.tool_calls:
+            kept.append(m)
+        elif isinstance(m, ToolMessage):
+            kept.append(m)
+        else:
+            continue
+
+        if _estimate_tokens(kept) > max_tokens:
+            if len(kept) > 2:
+                kept.pop(0)
+
+    if not kept:
+        return [HumanMessage(content="Continue from where you left off. Provide a final summary.")]
+    return kept
+
+
+def run_agent_checkpointed(system_prompt: str, workspace_dir: str, messages: list, checkpoint_path: str, max_steps: int = 500) -> dict:
     agent = create_agent(system_prompt, workspace_dir)
     state = {"messages": messages}
+    consecutive_tool_calls = 0
+
     for step in range(max_steps):
         try:
-            state = agent.invoke(state, config={"recursion_limit": 50})
+            state = agent.invoke(state, config={"recursion_limit": 100000})
         except Exception as e:
+            if "rate" in str(e).lower() or "429" in str(e):
+                raise
             logger.error("Agent step %d failed: %s", step, e)
             _save_checkpoint(checkpoint_path, state, step, str(e))
             raise
+
         _save_checkpoint(checkpoint_path, state, step, None)
+
         last = state["messages"][-1]
         if isinstance(last, AIMessage) and not last.tool_calls:
             return state
+
+        if isinstance(last, AIMessage) and last.tool_calls:
+            consecutive_tool_calls += 1
+        else:
+            consecutive_tool_calls = 0
+
+        if consecutive_tool_calls >= 20:
+            logger.warning("Forcing summary after %d consecutive tool calls", consecutive_tool_calls)
+            summary_msg = HumanMessage(content="You have made many tool calls. Now provide a final plain-text summary of everything you built.")
+            state["messages"].append(summary_msg)
+            try:
+                state = agent.invoke(state, config={"recursion_limit": 100000})
+                _save_checkpoint(checkpoint_path, state, step + 1, None)
+            except Exception as e:
+                if "rate" in str(e).lower() or "429" in str(e):
+                    raise
+                logger.error("Summary step failed: %s", e)
+                _save_checkpoint(checkpoint_path, state, step + 1, str(e))
+                raise
+            return state
+
+        state["messages"] = _compact_messages(state["messages"])
+
     return state
 
 
