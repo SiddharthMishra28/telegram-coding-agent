@@ -1,3 +1,6 @@
+fastapi
+uvicorn
+httpx
 langgraph
 langchain-openai
 langchain-core
