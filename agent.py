@@ -1,12 +1,7 @@
-import base64
-import json
 import logging
 import os
 import subprocess
 import sys
-import threading
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -21,7 +16,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     stream=sys.stdout,
 )
-logger = logging.getLogger("telegram-agent")
+logger = logging.getLogger("coding-agent")
 
 
 class AgentState(TypedDict):
@@ -35,14 +30,6 @@ class WriteFileInput(BaseModel):
 
 class RunCodeInput(BaseModel):
     file_path: str = Field(description="Relative path to the Python file to execute, e.g. app/main.py")
-
-
-class GitHubRepoInput(BaseModel):
-    repo_name: str = Field(description="Repository name, e.g. my-calculator-app")
-    content_map: dict[str, str] = Field(description="Map of file paths to file contents to commit")
-    message: str = Field(description="Commit message", default="Initial commit from coding agent")
-    token: str = Field(description="GitHub personal access token")
-    username: str = Field(description="GitHub username")
 
 
 def get_llm() -> ChatOpenAI:
@@ -102,63 +89,19 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
         except Exception as e:
             return f"Error listing directory: {e}"
 
-    @tool(args_schema=GitHubRepoInput)
-    def create_github_repo(repo_name: str, content_map: dict[str, str], message: str, token: str, username: str) -> str:
-        """Create a GitHub repo, commit multiple files, and enable GitHub Pages."""
-        repo_url = f"https://api.github.com/repos/{username}/{repo_name}"
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-        }
-
-        req = urllib.request.Request(repo_url, data=json.dumps({"name": repo_name, "private": False}).encode(), headers=headers, method="PUT")
-        try:
-            with urllib.request.urlopen(req) as resp:
-                repo_data = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            return f"Failed to create repo: {e.code} {body}"
-
-        for path, content in content_map.items():
-            file_url = f"{repo_url}/contents/{path}"
-            file_payload = json.dumps({
-                "message": message,
-                "content": base64.b64encode(content.encode()).decode(),
-            }).encode()
-            req = urllib.request.Request(file_url, data=file_payload, headers=headers, method="PUT")
-            try:
-                with urllib.request.urlopen(req) as resp:
-                    json.loads(resp.read().decode())
-            except urllib.error.HTTPError as e:
-                return f"Failed to create file {path}: {e.code} {e.read().decode()}"
-
-        pages_url = f"{repo_url}/pages"
-        pages_payload = json.dumps({"source": {"branch": "main", "path": "/"}}).encode()
-        req = urllib.request.Request(pages_url, data=pages_payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req) as resp:
-                pages_data = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            return f"Repo created, but failed to enable Pages: {e.code} {e.read().decode()}"
-
-        pages_host = pages_data.get("html_url", f"https://{username}.github.io/{repo_name}/")
-        return f"Created repo {username}/{repo_name} and enabled GitHub Pages at {pages_host}"
-
-    tools = [write_file, read_file, run_code, list_files, create_github_repo]
+    tools = [write_file, read_file, run_code, list_files]
     llm = get_llm()
     llm_with_tools = llm.bind_tools(tools)
 
     FINAL_INSTRUCTION = (
-        "\n\nIMPORTANT: After completing all tool calls, you MUST send a final plain-text message to the user. "
-        "Do NOT end the conversation with only tool calls. Summarize what you built, the files created, and the next steps."
+        "\n\nAfter creating all files, send a final plain-text summary listing every file you created and its purpose."
     )
 
     def agent_node(state: AgentState):
         messages = [{"role": "system", "content": system_prompt + FINAL_INSTRUCTION}] + state["messages"]
         logger.info("Invoking LLM with %d messages", len(messages))
         response = llm_with_tools.invoke(messages)
-        logger.info("LLM response: %s", response)
+        logger.info("LLM response content='%s' tool_calls=%s", response.content[:200], len(response.tool_calls or []))
         return {"messages": [response]}
 
     def tools_node(state: AgentState):
@@ -188,14 +131,3 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     graph.set_entry_point("agent")
     graph.add_conditional_edges("agent", should_continue)
     return graph.compile()
-
-
-def run_agent_with_timeout(system_prompt: str, workspace_dir: str, messages: list, timeout: int = 180) -> dict:
-    agent = create_agent(system_prompt, workspace_dir)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(agent.invoke, {"messages": messages}, config={"recursion_limit": 15})
-        try:
-            return future.result(timeout=timeout)
-        except FutureTimeoutError:
-            logger.error("Agent invocation timed out after %s seconds", timeout)
-            raise TimeoutError(f"Agent timed out after {timeout} seconds")

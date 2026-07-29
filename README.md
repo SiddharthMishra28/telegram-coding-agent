@@ -1,52 +1,35 @@
 # Telegram Coding Agent
 
-A conversational coding agent deployed on Render, controlled entirely through Telegram. Built with **LangGraph**, **FastAPI**, and the **Render MCP server**.
+A robust, plan-first coding agent deployed on Render, controlled entirely through Telegram. Built with **LangGraph**, **FastAPI**, and the **Render MCP server**.
+
+## Workflow
+
+1. Send any coding task to the bot
+2. Bot generates a **detailed plan** and asks for approval
+3. Approve / Reject with inline buttons
+4. If approved, bot asks for GitHub repo name and PAT
+5. Bot **incrementally creates files**, pushes to GitHub
+6. Bot **monitors GitHub Actions** for build completion
+7. Bot reports success/failure with logs
 
 ## Features
 
-- **Telegram-only interface** — chat with your agent via any Telegram client
-- **Customizable personality** — switch between `friendly`, `professional`, `concise`, and `verbose` modes, or set a fully custom system prompt
+- **Plan-first development** with user approval at every stage
+- **GitHub integration** — auto-creates repos, enables Pages, monitors Actions
+- **Task queue** — only 1 task at a time, others queued
+- **Persistent state** — task progress saved to disk (resumes after restart)
+- **Customizable personality** — switch between `friendly`, `professional`, `concise`, `verbose`
 - **OpenAI-compatible LLM** — works with any OpenAI-compatible API. Pre-configured for **NVIDIA NIM**.
-- **Coding tools** — read, write, and run Python files inside an isolated per-user workspace
-- **Conversation memory** — remembers context within a session
-- **Render deployment** — one-click deploy with `render.yaml`
 
-## LLM Configuration
+## Commands
 
-The agent uses `ChatOpenAI` from `langchain-openai`, which works with **any OpenAI-compatible API**.
-
-Set these environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LLM_API_KEY` | *(required)* | API key for your LLM provider |
-| `LLM_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Base URL for the API |
-| `LLM_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` | Model identifier |
-| `LLM_TEMPERATURE` | `0.7` | Sampling temperature |
-
-### Example: NVIDIA NIM
-
-```bash
-LLM_API_KEY=nvapi-...
-LLM_BASE_URL=https://integrate.api.nvidia.com/v1
-LLM_MODEL=nvidia/nemotron-3-ultra-550b-a55b
-```
-
-### Example: OpenAI
-
-```bash
-LLM_API_KEY=sk-...
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-4o-mini
-```
-
-### Example: Local Ollama
-
-```bash
-LLM_API_KEY=ollama
-LLM_BASE_URL=http://localhost:11434/v1
-LLM_MODEL=llama3.1
-```
+- `/start` — Welcome message
+- `/reset` — Clear conversation
+- `/status` — Show current task status
+- `/queue` — List queued tasks
+- `/cancel` — Cancel current task
+- `/personality <mode>` — Switch agent behavior
+- `/help` — Show help
 
 ## Setup
 
@@ -56,46 +39,30 @@ cp .env.example .env
 pip install -r requirements.txt
 ```
 
-Fill in `.env` with your Telegram bot token and LLM credentials.
-
 ## Run locally
 
 ```bash
 python main.py
 ```
 
-Set your Telegram webhook to `http://<your-ip>:8000/webhook/<TOKEN>`.
-
 ## Deploy to Render
 
 1. Push this repo to GitHub
 2. In Render Dashboard, create a new **Web Service**
 3. Connect your repo and select `render.yaml`
-4. Add env vars: `TELEGRAM_BOT_TOKEN`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`
-5. Deploy — your bot will be live at `https://telegram-coding-agent.onrender.com`
-
-## Commands
-
-- `/start` — Welcome message
-- `/reset` — Clear conversation
-- `/personality <mode>` — Switch agent behavior
-- `/help` — Show help
+4. Add env vars: `TELEGRAM_BOT_TOKEN`, `LLM_API_KEY`, `GITHUB_USERNAME`, `GITHUB_PAT`
+5. Deploy
 
 ## Architecture
 
 ```
-Telegram → Render Webhook → FastAPI → BackgroundTask → LangGraph Agent
-                                                           ↓
-                                                     Tools (read/write/run)
-                                                           ↓
-                                                     Reply via Telegram API
+Telegram → Render Webhook → FastAPI → BackgroundTasks → Task Store
+                                                          ↓
+                                                    Task Queue
+                                                          ↓
+                                                Planner → Agent → GitHub
+                                                          ↓
+                                                GitHub Actions Monitor
+                                                          ↓
+                                                    Telegram Reply
 ```
-
-## Learning Goals
-
-This project demonstrates:
-- **LangGraph ReAct loop** with tool calling
-- **Personality injection** via dynamic system prompts
-- **OpenAI-compatible LLM switching** via environment variables
-- **Stateless webhook handling** with FastAPI
-- **MCP-driven deployment** using Render's MCP server
