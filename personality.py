@@ -62,26 +62,26 @@ class PersonalityConfig(BaseModel):
         e = "✨" if self.emoji else ""
         tone_label = self.tone.capitalize()
         return (
-            f"{e} Hi! I'm *{self.name}* — your personal coding assistant.\n\n"
-            f"Current mode: *{tone_label}*\n"
+            f"{e} Hi! I'm {self.name} — your personal coding assistant.\n\n"
+            f"Current mode: {tone_label}\n"
             "Send me any coding task and I will build it step by step.\n\n"
             "Commands:\n"
-            "`/start` — Show this welcome\n"
-            "`/reset` — Clear our conversation\n"
-            "`/personality` `<friendly|professional|concise|verbose|custom>` — Switch behavior\n"
-            "`/help` — Show commands\n\n"
+            "/start — Show this welcome\n"
+            "/reset — Clear our conversation\n"
+            "/personality <friendly|professional|concise|verbose|custom> — Switch behavior\n"
+            "/help — Show commands\n\n"
             "What would you like to build?"
         )
 
     def get_help_message(self) -> str:
         e = "🛠️" if self.emoji else ""
         return (
-            f"{e} *{self.name}* can help you write, read, and run code.\n\n"
+            f"{e} {self.name} can help you write, read, and run code.\n\n"
             "Just describe what you want in plain English. Examples:\n"
-            "• \"Write a Python script that prints the first 10 Fibonacci numbers\"\n"
-            "• \"Create a calculator.py with add and multiply functions\"\n"
-            "• \"Read main.py and suggest improvements\"\n\n"
-            "Use `/personality` to change how I behave."
+            '• "Write a Python script that prints the first 10 Fibonacci numbers"\n'
+            '• "Create a calculator.py with add and multiply functions"\n'
+            '• "Read main.py and suggest improvements"\n\n'
+            "Use /personality to change how I behave."
         )
 
     def get_reset_message(self) -> str:

@@ -42,10 +42,15 @@ def _tg(method: str, payload: dict) -> dict:
 
 def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     logger.info("Sending message to %s: %s", chat_id, text[:200])
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n...(truncated)"
+    payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    _tg("sendMessage", payload)
+    try:
+        _tg("sendMessage", payload)
+    except httpx.HTTPStatusError as e:
+        logger.error("Failed to send message: %s %s", e.response.status_code, e.response.text)
 
 
 def answer_callback(callback_query_id: str, text: str | None = None, show_alert: bool = False):
@@ -107,7 +112,7 @@ def process_task(task: Task):
     except Exception as e:
         logger.exception("Task %s failed: %s", task.task_id, e)
         store.fail_active(str(e))
-        send_message(task.chat_id, f"⚠️ Task failed: `{e}`")
+        send_message(task.chat_id, f"Task failed: {e}")
 
 
 def _handle_planning(task: Task):
@@ -117,9 +122,10 @@ def _handle_planning(task: Task):
     else:
         plan = generate_plan(task.prompt)
     store.update_task(task.task_id, plan=plan, state=TaskState.awaiting_approval, attempts=task.attempts + 1)
+    plan_text = f"Plan (attempt {task.attempts + 1}/{task.max_attempts})\n\n{plan}\n\nDo you approve this plan?"
     send_message(
         task.chat_id,
-        f"📋 *Plan (attempt {task.attempts + 1}/{task.max_attempts})*\n\n{plan}\n\nDo you approve this plan?",
+        plan_text,
         reply_markup=plan_approval_keyboard(task.task_id),
     )
 
@@ -146,7 +152,7 @@ def _handle_executing(task: Task):
             files.append(os.path.relpath(full, workspace_dir).replace("\\", "/"))
 
     store.update_task(task.task_id, files=files, state=TaskState.pushing)
-    send_message(task.chat_id, f"✅ Created {len(files)} files locally.\n\nPushing to GitHub...")
+    send_message(task.chat_id, f"Created {len(files)} files locally.\n\nPushing to GitHub...")
 
 
 def _handle_pushing(task: Task):
@@ -173,12 +179,12 @@ def _handle_pushing(task: Task):
         store.update_task(task.task_id, state=TaskState.monitoring_actions)
         pages_url = f"https://{task.github_username}.github.io/{task.repo_name}/"
         store.update_task(task.task_id, pages_url=pages_url)
-        send_message(task.chat_id, f"🚀 Pushed to GitHub. Monitoring Actions build...\n\nPages: {pages_url}")
+        send_message(task.chat_id, f"Pushed to GitHub. Monitoring Actions build...\n\nPages: {pages_url}")
         _handle_monitoring(task)
     except Exception as e:
         logger.exception("Push failed for task %s", task.task_id)
         store.fail_active(str(e))
-        send_message(task.chat_id, f"⚠️ Push failed: `{e}`")
+        send_message(task.chat_id, f"Push failed: {e}")
 
 
 def _handle_monitoring(task: Task):
@@ -189,7 +195,7 @@ def _handle_monitoring(task: Task):
             store.complete_active()
             send_message(
                 task.chat_id,
-                f"🎉 *Build succeeded!*\n\nPages: {task.pages_url}\n\nRepo: https://github.com/{task.github_username}/{task.repo_name}",
+                f"Build succeeded!\n\nPages: {task.pages_url}\n\nRepo: https://github.com/{task.github_username}/{task.repo_name}",
                 reply_markup=task_control_keyboard(task.task_id),
             )
         else:
@@ -197,16 +203,16 @@ def _handle_monitoring(task: Task):
             store.fail_active(result.get("conclusion", "failed"))
             send_message(
                 task.chat_id,
-                f"❌ Build failed with conclusion: {result.get('conclusion')}\n\nLogs:\n```\n{logs}\n```",
+                f"Build failed with conclusion: {result.get('conclusion')}\n\nLogs:\n{logs}",
                 reply_markup=task_control_keyboard(task.task_id),
             )
     except TimeoutError as e:
         store.fail_active(str(e))
-        send_message(task.chat_id, f"⏰ Build timed out: `{e}`")
+        send_message(task.chat_id, f"Build timed out: {e}")
     except Exception as e:
         logger.exception("Monitoring failed for task %s", task.task_id)
         store.fail_active(str(e))
-        send_message(task.chat_id, f"⚠️ Monitoring failed: `{e}`")
+        send_message(task.chat_id, f"Monitoring failed: {e}")
 
 
 @app.post("/webhook/{token}")
@@ -257,7 +263,7 @@ def handle_callback(callback: dict):
         if action == "approve":
             store.update_task(task.task_id, state=TaskState.awaiting_repo)
             answer_callback(callback_query_id, "Plan approved")
-            send_message(chat_id, "✅ Plan approved. Provide a GitHub repo name (e.g. `my-calculator-app`).")
+            send_message(chat_id, "Plan approved. Provide a GitHub repo name (e.g. my-calculator-app).")
         elif action == "reject":
             answer_callback(callback_query_id, "Plan rejected")
             store.update_task(task.task_id, state=TaskState.planning)
@@ -271,15 +277,15 @@ def handle_callback(callback: dict):
         if action == "cancel":
             store.cancel_active()
             answer_callback(callback_query_id, "Task cancelled")
-            send_message(chat_id, "🛑 Task cancelled.")
+            send_message(chat_id, "Task cancelled.")
         elif action == "pause":
             store.update_task(task.task_id, state=TaskState.queued)
             answer_callback(callback_query_id, "Task paused")
-            send_message(chat_id, "⏸ Task paused.")
+            send_message(chat_id, "Task paused.")
         elif action == "resume":
             store.set_active(task.task_id)
             answer_callback(callback_query_id, "Task resumed")
-            send_message(chat_id, "▶ Task resumed.")
+            send_message(chat_id, "Task resumed.")
 
 
 def handle_command(user_id: int, chat_id: int, text: str):
@@ -304,7 +310,7 @@ def handle_command(user_id: int, chat_id: int, text: str):
         if not task:
             send_message(chat_id, "No active task.")
             return
-        send_message(chat_id, f"Task `{task.task_id}`\nState: {task.state.value}\nPrompt: {task.prompt[:200]}")
+        send_message(chat_id, f"Task {task.task_id}\nState: {task.state.value}\nPrompt: {task.prompt[:200]}")
         return
 
     if cmd == "/queue":
@@ -312,8 +318,8 @@ def handle_command(user_id: int, chat_id: int, text: str):
         if not tasks:
             send_message(chat_id, "No tasks in queue.")
             return
-        lines = [f"`{t.task_id}` - {t.state.value} - {t.prompt[:100]}" for t in tasks]
-        send_message(chat_id, "📋 Your tasks:\n" + "\n".join(lines))
+        lines = [f"{t.task_id} - {t.state.value} - {t.prompt[:100]}" for t in tasks]
+        send_message(chat_id, "Your tasks:\n" + "\n".join(lines))
         return
 
     if cmd == "/cancel":
@@ -322,7 +328,7 @@ def handle_command(user_id: int, chat_id: int, text: str):
             send_message(chat_id, "No active task to cancel.")
             return
         store.cancel_active()
-        send_message(chat_id, "🛑 Task cancelled.")
+        send_message(chat_id, "Task cancelled.")
         return
 
     if cmd == "/personality":
@@ -339,7 +345,7 @@ def handle_command(user_id: int, chat_id: int, text: str):
             send_message(chat_id, "Set `AGENT_CUSTOM_PERSONA` in your Render env vars.")
             return
         personality.tone = tone
-        send_message(chat_id, f"Personality updated to *{tone}*.")
+        send_message(chat_id, f"Personality updated to {tone}.")
         return
 
     send_message(chat_id, "Unknown command. Use /help to see available commands.")
@@ -353,7 +359,7 @@ def handle_message(user_id: int, chat_id: int, text: str):
         if task.state == TaskState.awaiting_repo:
             repo_name = re.sub(r"[^a-zA-Z0-9\-]", "-", text.strip().lower())
             store.update_task(task.task_id, repo_name=repo_name, state=TaskState.awaiting_pat)
-            send_message(chat_id, f"Repo name set to `{repo_name}`.\n\nPlease provide your GitHub PAT.")
+            send_message(chat_id, f"Repo name set to {repo_name}.\n\nPlease provide your GitHub PAT.")
             return
         elif task.state == TaskState.awaiting_pat:
             token = re.search(r"([A-Za-z0-9_]{30,})", text)
@@ -361,7 +367,7 @@ def handle_message(user_id: int, chat_id: int, text: str):
                 send_message(chat_id, "Please provide a valid GitHub PAT.")
                 return
             store.update_task(task.task_id, github_pat=token.group(1), state=TaskState.executing)
-            send_message(chat_id, "✅ Credentials saved. Starting execution...")
+            send_message(chat_id, "Credentials saved. Starting execution...")
             process_task(store.get_active_task())
             return
         elif task.state == TaskState.planning:
@@ -374,11 +380,11 @@ def handle_message(user_id: int, chat_id: int, text: str):
     task_id = f"task-{user_id}-{int(time.time())}"
     task = Task(task_id=task_id, user_id=user_id, chat_id=chat_id, prompt=text)
     store.add_task(task)
-    send_message(chat_id, f"📝 New task queued: `{task_id}`\nState: {task.state.value}")
+    send_message(chat_id, f"New task queued: {task_id}\nState: {task.state.value}")
     if store.get_active_task() and store.get_active_task().task_id == task_id:
         process_task(task)
     else:
-        send_message(chat_id, "⏳ Task queued. It will start when the current task completes.")
+        send_message(chat_id, "Task queued. It will start when the current task completes.")
 
 
 @app.get("/setwebhook")
