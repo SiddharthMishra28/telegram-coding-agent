@@ -4,10 +4,10 @@ import re
 import sys
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-from agent import create_agent
+from agent import create_agent, run_agent_with_timeout
 from personality import PersonalityConfig
 from langchain_core.messages import HumanMessage
 
@@ -46,7 +46,7 @@ def send_typing(chat_id: int):
         })
 
 
-def extract_github_token(text: str) -> tuple[str, str]:
+def extract_github_creds(text: str) -> tuple[str, str]:
     match = re.search(r"github\s*(?:pat|token|personal\s*access\s*token)?\s*[:\-]?\s*([A-Za-z0-9_]{30,})", text, re.IGNORECASE)
     username_match = re.search(r"github\s*(?:username)?\s*[:\-]?\s*([A-Za-z0-9](?:[A-Za-z0-9\-]{1,38}))", text, re.IGNORECASE)
     token = match.group(1) if match else os.getenv("GITHUB_PAT", "")
@@ -54,8 +54,72 @@ def extract_github_token(text: str) -> tuple[str, str]:
     return token, username
 
 
+def process_message(user_id: int, chat_id: int, text: str):
+    text = text.strip()
+
+    if text == "/start":
+        conversations.pop(user_id, None)
+        send_message(chat_id, personality.get_welcome_message())
+        return
+
+    if text == "/reset":
+        conversations.pop(user_id, None)
+        send_message(chat_id, personality.get_reset_message())
+        return
+
+    if text == "/help":
+        send_message(chat_id, personality.get_help_message())
+        return
+
+    if text.startswith("/personality"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            send_message(chat_id, "Usage: `/personality <friendly|professional|concise|verbose|custom>`")
+            return
+        tone = parts[1].strip().lower()
+        valid = {"friendly", "professional", "concise", "verbose", "custom"}
+        if tone not in valid:
+            send_message(chat_id, f"Unknown tone. Choose from: {', '.join(sorted(valid))}")
+            return
+        if tone == "custom":
+            send_message(chat_id, "Set `AGENT_CUSTOM_PERSONA` in your Render env vars to a custom system prompt.")
+            return
+        personality.tone = tone
+        send_message(chat_id, f"Personality updated to *{tone}*. From now on I'll behave accordingly.")
+        return
+
+    send_typing(chat_id)
+    workspace_dir = os.path.join(os.getcwd(), "workspace", str(user_id))
+    os.makedirs(workspace_dir, exist_ok=True)
+
+    try:
+        gh_token, gh_username = extract_github_creds(text)
+        logger.info("Extracted GitHub username=%s token_present=%s", bool(gh_username), bool(gh_token))
+
+        if gh_token and gh_username:
+            text = f"{text}\n\n[SYSTEM_INJECTED_CREDS]\nGitHub username: {gh_username}\nGitHub PAT: {gh_token}"
+
+        history = conversations.get(user_id, [])
+        result = run_agent_with_timeout(
+            personality.get_system_prompt(),
+            workspace_dir,
+            history + [HumanMessage(content=text)],
+            timeout=180,
+        )
+        response = result["messages"][-1].content
+        conversations[user_id] = result["messages"]
+        if not response or not response.strip():
+            response = "I finished the task but didn't produce a final summary. Check the workspace files."
+        if len(response) > 4000:
+            response = response[:4000] + "\n\n...(truncated)"
+        send_message(chat_id, response)
+    except Exception as e:
+        logger.exception("Failed to process message")
+        send_message(chat_id, f"⚠️ Something went wrong: `{e}`")
+
+
 @app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
+async def webhook(token: str, request: Request, background_tasks: BackgroundTasks):
     if token != BOT_TOKEN:
         logger.warning("Unauthorized webhook attempt with token %s", token)
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -70,60 +134,7 @@ async def webhook(token: str, request: Request):
     text = message["text"].strip()
     logger.info("Received message from user %s chat %s: %s", user_id, chat_id, text[:200])
 
-    if text == "/start":
-        conversations.pop(user_id, None)
-        send_message(chat_id, personality.get_welcome_message())
-        return JSONResponse({"ok": True})
-
-    if text == "/reset":
-        conversations.pop(user_id, None)
-        send_message(chat_id, personality.get_reset_message())
-        return JSONResponse({"ok": True})
-
-    if text == "/help":
-        send_message(chat_id, personality.get_help_message())
-        return JSONResponse({"ok": True})
-
-    if text.startswith("/personality"):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
-            send_message(chat_id, "Usage: `/personality <friendly|professional|concise|verbose|custom>`")
-            return JSONResponse({"ok": True})
-        tone = parts[1].strip().lower()
-        valid = {"friendly", "professional", "concise", "verbose", "custom"}
-        if tone not in valid:
-            send_message(chat_id, f"Unknown tone. Choose from: {', '.join(sorted(valid))}")
-            return JSONResponse({"ok": True})
-        if tone == "custom":
-            send_message(chat_id, "Set `AGENT_CUSTOM_PERSONA` in your Render env vars to a custom system prompt.")
-            return JSONResponse({"ok": True})
-        personality.tone = tone
-        send_message(chat_id, f"Personality updated to *{tone}*. From now on I'll behave accordingly.")
-        return JSONResponse({"ok": True})
-
-    send_typing(chat_id)
-    workspace_dir = os.path.join(os.getcwd(), "workspace", str(user_id))
-    os.makedirs(workspace_dir, exist_ok=True)
-
-    try:
-        gh_token, gh_username = extract_github_token(text)
-        logger.info("Extracted GitHub username=%s token_present=%s", bool(gh_username), bool(gh_token))
-
-        agent = create_agent(personality.get_system_prompt(), workspace_dir)
-        history = conversations.get(user_id, [])
-        result = agent.invoke(
-            {"messages": history + [HumanMessage(content=text)]},
-            config={"recursion_limit": 50},
-        )
-        response = result["messages"][-1].content
-        conversations[user_id] = result["messages"]
-        if len(response) > 4000:
-            response = response[:4000] + "\n\n...(truncated)"
-        send_message(chat_id, response)
-    except Exception as e:
-        logger.exception("Failed to process message")
-        send_message(chat_id, f"⚠️ Something went wrong: `{e}`")
-
+    background_tasks.add_task(process_message, user_id, chat_id, text)
     return JSONResponse({"ok": True})
 
 

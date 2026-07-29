@@ -1,7 +1,12 @@
+import base64
+import json
 import logging
 import os
 import subprocess
 import sys
+import threading
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -100,10 +105,6 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     @tool(args_schema=GitHubRepoInput)
     def create_github_repo(repo_name: str, content_map: dict[str, str], message: str, token: str, username: str) -> str:
         """Create a GitHub repo, commit multiple files, and enable GitHub Pages."""
-        import base64
-        import urllib.request
-        import json
-
         repo_url = f"https://api.github.com/repos/{username}/{repo_name}"
         headers = {
             "Authorization": f"token {token}",
@@ -119,7 +120,6 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
             body = e.read().decode()
             return f"Failed to create repo: {e.code} {body}"
 
-        # Create files via Git Data API
         for path, content in content_map.items():
             file_url = f"{repo_url}/contents/{path}"
             file_payload = json.dumps({
@@ -149,8 +149,13 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     llm = get_llm()
     llm_with_tools = llm.bind_tools(tools)
 
+    FINAL_INSTRUCTION = (
+        "\n\nIMPORTANT: After completing all tool calls, you MUST send a final plain-text message to the user. "
+        "Do NOT end the conversation with only tool calls. Summarize what you built, the files created, and the next steps."
+    )
+
     def agent_node(state: AgentState):
-        messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+        messages = [{"role": "system", "content": system_prompt + FINAL_INSTRUCTION}] + state["messages"]
         logger.info("Invoking LLM with %d messages", len(messages))
         response = llm_with_tools.invoke(messages)
         logger.info("LLM response: %s", response)
@@ -183,3 +188,14 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     graph.set_entry_point("agent")
     graph.add_conditional_edges("agent", should_continue)
     return graph.compile()
+
+
+def run_agent_with_timeout(system_prompt: str, workspace_dir: str, messages: list, timeout: int = 180) -> dict:
+    agent = create_agent(system_prompt, workspace_dir)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(agent.invoke, {"messages": messages}, config={"recursion_limit": 15})
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError:
+            logger.error("Agent invocation timed out after %s seconds", timeout)
+            raise TimeoutError(f"Agent timed out after {timeout} seconds")
