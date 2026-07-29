@@ -8,8 +8,14 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: OPENAI_API_KEY
+      - key: LLM_API_KEY
         sync: false
+      - key: LLM_BASE_URL
+        value: https://integrate.api.nvidia.com/v1
+      - key: LLM_MODEL
+        value: nvidia/nemotron-3-ultra-550b-a55b
+      - key: LLM_TEMPERATURE
+        value: "0.7"
       - key: AGENT_TONE
         value: friendly
       - key: AGENT_NAME
