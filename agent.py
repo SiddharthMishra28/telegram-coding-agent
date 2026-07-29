@@ -23,6 +23,15 @@ class RunCodeInput(BaseModel):
     file_path: str = Field(description="Relative path to the Python file to execute, e.g. app/main.py")
 
 
+def get_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=os.getenv("LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"),
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
+        base_url=os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+        api_key=os.getenv("LLM_API_KEY", ""),
+    )
+
+
 def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     @tool(args_schema=WriteFileInput)
     def write_file(path: str, content: str) -> str:
@@ -72,7 +81,7 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
             return f"Error listing directory: {e}"
 
     tools = [write_file, read_file, run_code, list_files]
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
+    llm = get_llm()
     llm_with_tools = llm.bind_tools(tools)
 
     def agent_node(state: AgentState):
