@@ -1,5 +1,7 @@
+import logging
 import os
 import subprocess
+import sys
 from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -8,6 +10,13 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, BaseMe
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("telegram-agent")
 
 
 class AgentState(TypedDict):
@@ -21,6 +30,14 @@ class WriteFileInput(BaseModel):
 
 class RunCodeInput(BaseModel):
     file_path: str = Field(description="Relative path to the Python file to execute, e.g. app/main.py")
+
+
+class GitHubRepoInput(BaseModel):
+    repo_name: str = Field(description="Repository name, e.g. my-calculator-app")
+    content_map: dict[str, str] = Field(description="Map of file paths to file contents to commit")
+    message: str = Field(description="Commit message", default="Initial commit from coding agent")
+    token: str = Field(description="GitHub personal access token")
+    username: str = Field(description="GitHub username")
 
 
 def get_llm() -> ChatOpenAI:
@@ -80,13 +97,64 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
         except Exception as e:
             return f"Error listing directory: {e}"
 
-    tools = [write_file, read_file, run_code, list_files]
+    @tool(args_schema=GitHubRepoInput)
+    def create_github_repo(repo_name: str, content_map: dict[str, str], message: str, token: str, username: str) -> str:
+        """Create a GitHub repo, commit multiple files, and enable GitHub Pages."""
+        import base64
+        import urllib.request
+        import json
+
+        repo_url = f"https://api.github.com/repos/{username}/{repo_name}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        }
+
+        req = urllib.request.Request(repo_url, data=json.dumps({"name": repo_name, "private": False}).encode(), headers=headers, method="PUT")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                repo_data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            return f"Failed to create repo: {e.code} {body}"
+
+        # Create files via Git Data API
+        for path, content in content_map.items():
+            file_url = f"{repo_url}/contents/{path}"
+            file_payload = json.dumps({
+                "message": message,
+                "content": base64.b64encode(content.encode()).decode(),
+            }).encode()
+            req = urllib.request.Request(file_url, data=file_payload, headers=headers, method="PUT")
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                return f"Failed to create file {path}: {e.code} {e.read().decode()}"
+
+        pages_url = f"{repo_url}/pages"
+        pages_payload = json.dumps({"source": {"branch": "main", "path": "/"}}).encode()
+        req = urllib.request.Request(pages_url, data=pages_payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                pages_data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            return f"Repo created, but failed to enable Pages: {e.code} {e.read().decode()}"
+
+        pages_host = pages_data.get("html_url", f"https://{username}.github.io/{repo_name}/")
+        return f"Created repo {username}/{repo_name} and enabled GitHub Pages at {pages_host}"
+
+    tools = [write_file, read_file, run_code, list_files, create_github_repo]
     llm = get_llm()
     llm_with_tools = llm.bind_tools(tools)
 
     def agent_node(state: AgentState):
         messages = [{"role": "system", "content": system_prompt}] + state["messages"]
-        return {"messages": [llm_with_tools.invoke(messages)]}
+        logger.info("Invoking LLM with %d messages", len(messages))
+        response = llm_with_tools.invoke(messages)
+        logger.info("LLM response: %s", response)
+        return {"messages": [response]}
 
     def tools_node(state: AgentState):
         last_message = state["messages"][-1]
@@ -94,7 +162,9 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
         tool_map = {t.name: t for t in tools}
         for call in last_message.tool_calls:
             selected_tool = tool_map[call["name"]]
+            logger.info("Running tool %s with args %s", call["name"], call["args"])
             observation = selected_tool.invoke(call["args"])
+            logger.info("Tool %s result: %s", call["name"], observation[:500])
             tool_messages.append(
                 ToolMessage(content=str(observation), tool_call_id=call["id"])
             )
