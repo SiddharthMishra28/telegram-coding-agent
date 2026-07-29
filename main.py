@@ -246,9 +246,12 @@ async def webhook(token: str, request: Request, background_tasks: BackgroundTask
 
 def handle_callback(callback: dict):
     user_id = callback["from"]["id"]
-    chat_id = callback["chat"]["id"]
     data = callback["data"]
     callback_query_id = callback["id"]
+    message = callback.get("message")
+    if not message:
+        return
+    chat_id = message["chat"]["id"]
 
     task = store.get_active_task()
     if not task or task.user_id != user_id:
