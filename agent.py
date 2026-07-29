@@ -1,7 +1,12 @@
+import base64
+import json
 import logging
 import os
 import subprocess
 import sys
+import threading
+import time
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -30,6 +35,28 @@ class WriteFileInput(BaseModel):
 
 class RunCodeInput(BaseModel):
     file_path: str = Field(description="Relative path to the Python file to execute, e.g. app/main.py")
+
+
+class RateLimiter:
+    def __init__(self):
+        self.requests: list[float] = []
+        self.lock = threading.Lock()
+
+    def wait(self, rpm: int = 60):
+        min_interval = 60.0 / rpm
+        now = time.time()
+        with self.lock:
+            self.requests = [t for t in self.requests if now - t < 60]
+            if len(self.requests) >= rpm:
+                sleep_time = 60 - (now - self.requests[0])
+                if sleep_time > 0:
+                    logger.info("Rate limit reached, sleeping for %.1f seconds", sleep_time)
+                    time.sleep(sleep_time)
+                    self.requests = [t for t in self.requests if time.time() - t < 60]
+            self.requests.append(time.time())
+
+
+_rate_limiter = RateLimiter()
 
 
 def get_llm() -> ChatOpenAI:
@@ -100,6 +127,7 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     def agent_node(state: AgentState):
         messages = [{"role": "system", "content": system_prompt + FINAL_INSTRUCTION}] + state["messages"]
         logger.info("Invoking LLM with %d messages", len(messages))
+        _rate_limiter.wait()
         response = llm_with_tools.invoke(messages)
         logger.info("LLM response content='%s' tool_calls=%s", response.content[:200], len(response.tool_calls or []))
         return {"messages": [response]}
@@ -131,3 +159,53 @@ def create_agent(system_prompt: str, workspace_dir: str) -> Any:
     graph.set_entry_point("agent")
     graph.add_conditional_edges("agent", should_continue)
     return graph.compile()
+
+
+def run_agent_checkpointed(system_prompt: str, workspace_dir: str, messages: list, checkpoint_path: str, max_steps: int = 200) -> dict:
+    agent = create_agent(system_prompt, workspace_dir)
+    state = {"messages": messages}
+    for step in range(max_steps):
+        try:
+            state = agent.invoke(state, config={"recursion_limit": 50})
+        except Exception as e:
+            logger.error("Agent step %d failed: %s", step, e)
+            _save_checkpoint(checkpoint_path, state, step, str(e))
+            raise
+        _save_checkpoint(checkpoint_path, state, step, None)
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage) and not last.tool_calls:
+            return state
+    return state
+
+
+def _save_checkpoint(path: str, state: dict, step: int, error: str | None):
+    try:
+        checkpoint = {
+            "step": step,
+            "error": error,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "messages": [
+                {
+                    "type": m.__class__.__name__,
+                    "content": getattr(m, "content", ""),
+                    "tool_calls": getattr(m, "tool_calls", None),
+                    "additional_kwargs": getattr(m, "additional_kwargs", {}),
+                }
+                for m in state.get("messages", [])
+            ],
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(checkpoint, f, indent=2)
+        import os as _os
+        _os.replace(tmp, path)
+    except Exception as e:
+        logger.error("Failed to save checkpoint: %s", e)
+
+
+def load_checkpoint(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None

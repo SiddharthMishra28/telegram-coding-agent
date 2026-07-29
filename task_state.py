@@ -16,6 +16,7 @@ class TaskState(str, Enum):
     executing = "executing"
     pushing = "pushing"
     monitoring_actions = "monitoring_actions"
+    paused_rate_limit = "paused_rate_limit"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
@@ -49,6 +50,8 @@ class Task:
         self.result: str | None = None
         self.attempts: int = 0
         self.max_attempts: int = 3
+        self.resume_at: str | None = None
+        self.checkpoint_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +74,8 @@ class Task:
             "result": self.result,
             "attempts": self.attempts,
             "max_attempts": self.max_attempts,
+            "resume_at": self.resume_at,
+            "checkpoint_path": self.checkpoint_path,
         }
 
     @classmethod
@@ -95,6 +100,8 @@ class Task:
         task.result = data.get("result")
         task.attempts = data.get("attempts", 0)
         task.max_attempts = data.get("max_attempts", 3)
+        task.resume_at = data.get("resume_at")
+        task.checkpoint_path = data.get("checkpoint_path")
         return task
 
 
@@ -250,6 +257,10 @@ class TaskStore:
             if task.state == TaskState.queued:
                 return task
         return None
+
+    def get_paused_tasks(self) -> list[Task]:
+        now = datetime.now(timezone.utc).isoformat()
+        return [t for t in self._tasks.values() if t.state == TaskState.paused_rate_limit and t.resume_at and t.resume_at <= now]
 
     def all_tasks(self) -> list[Task]:
         return list(self._tasks.values())

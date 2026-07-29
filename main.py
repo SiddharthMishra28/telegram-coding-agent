@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from task_state import TaskStore, TaskState, Task
 from github_manager import GitHubManager
 from planner import generate_plan, revise_plan
-from agent import create_agent
+from agent import create_agent, run_agent_checkpointed, load_checkpoint
 from personality import PersonalityConfig
 from langchain_core.messages import HumanMessage
 from keyboards import plan_approval_keyboard, task_control_keyboard
@@ -135,15 +135,56 @@ def _handle_executing(task: Task):
     workspace_dir = os.path.join(os.getcwd(), "workspace", str(task.user_id), task.task_id)
     os.makedirs(workspace_dir, exist_ok=True)
 
+    checkpoint_path = os.path.join(workspace_dir, "agent_checkpoint.json")
+    task = store.update_task(task.task_id, checkpoint_path=checkpoint_path)
+
     prompt = (
         f"Create the following project according to this plan:\n\n{task.plan}\n\n"
         "Use write_file to create every required file. After creating all files, provide a summary."
     )
-    agent = create_agent(personality.get_system_prompt(), workspace_dir)
-    result = agent.invoke(
-        {"messages": [HumanMessage(content=prompt)]},
-        config={"recursion_limit": 20},
-    )
+
+    checkpoint = load_checkpoint(checkpoint_path)
+    if checkpoint and checkpoint.get("error") and "rate" in checkpoint["error"].lower():
+        messages = [
+            HumanMessage(content=msg["content"])
+            for msg in checkpoint.get("messages", [])
+            if msg.get("type") == "HumanMessage"
+        ]
+        if not messages:
+            messages = [HumanMessage(content=prompt)]
+    elif checkpoint:
+        from langchain_core.messages import AIMessage, ToolMessage
+        messages = []
+        for msg in checkpoint.get("messages", []):
+            cls = {"HumanMessage": HumanMessage, "AIMessage": AIMessage, "ToolMessage": ToolMessage}.get(msg["type"])
+            if cls:
+                messages.append(cls(**msg))
+        if not messages:
+            messages = [HumanMessage(content=prompt)]
+    else:
+        messages = [HumanMessage(content=prompt)]
+
+    try:
+        result = run_agent_checkpointed(
+            personality.get_system_prompt(),
+            workspace_dir,
+            messages,
+            checkpoint_path,
+            max_steps=200,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        if "rate" in error_msg.lower() or "429" in error_msg:
+            resume_at = datetime.now(timezone.utc).replace(minute=(datetime.now(timezone.utc).minute + 15) % 60)
+            resume_at_str = resume_at.isoformat()
+            store.update_task(task.task_id, state=TaskState.paused_rate_limit, resume_at=resume_at_str)
+            send_message(
+                task.chat_id,
+                f"Hit API rate limit. Pausing task for 15 minutes. Will resume at {resume_at_str}. I'll notify you when I continue.",
+            )
+            _schedule_cron()
+            return
+        raise
 
     files = []
     for root, _, filenames in os.walk(workspace_dir):
@@ -242,6 +283,55 @@ async def webhook(token: str, request: Request, background_tasks: BackgroundTask
         background_tasks.add_task(handle_message, user_id, chat_id, text)
 
     return JSONResponse({"ok": True})
+
+
+@app.get("/resume")
+async def resume():
+    paused = store.get_paused_tasks()
+    if not paused:
+        return JSONResponse({"status": "ok", "message": "No paused tasks to resume"})
+
+    resumed = []
+    for task in paused:
+        store.set_active(task.task_id)
+        store.update_task(task.task_id, state=TaskState.executing, resume_at=None)
+        resumed.append(task.task_id)
+        send_message(task.chat_id, f"Resuming task {task.task_id} from rate limit pause.")
+        process_task(task)
+
+    return JSONResponse({"status": "ok", "resumed": resumed})
+
+
+@app.get("/setwebhook")
+async def set_webhook():
+    service_name = os.getenv("RENDER_SERVICE_NAME", "telegram-coding-agent")
+    url = f"https://{service_name}.onrender.com/webhook/{BOT_TOKEN}"
+    resp = _tg("setWebhook", {"url": url})
+    return JSONResponse(resp)
+
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
+
+
+def _schedule_cron():
+    service_name = os.getenv("RENDER_SERVICE_NAME", "telegram-coding-agent")
+    resume_url = f"https://{service_name}.onrender.com/resume"
+    cron_url = f"https://api.render.com/v1/cron-jobs"
+    cron_payload = {
+        "name": "telegram-coding-agent-resume",
+        "serviceId": os.getenv("RENDER_SERVICE_ID", ""),
+        "schedule": "*/15 * * * *",
+        "url": resume_url,
+        "httpMethod": "GET",
+    }
+    try:
+        with httpx.Client() as client:
+            resp = client.post(cron_url, json=cron_payload, headers={"Authorization": f"Bearer {os.getenv('RENDER_API_KEY', '')}"})
+            logger.info("Scheduled cron job: %s", resp.status_code)
+    except Exception as e:
+        logger.error("Failed to schedule cron: %s", e)
 
 
 def handle_callback(callback: dict):
@@ -374,12 +464,10 @@ def handle_message(user_id: int, chat_id: int, text: str):
             process_task(store.get_active_task())
             return
         elif task.state == TaskState.planning:
-            # User is providing feedback for plan revision
             store.update_task(task.task_id, state=TaskState.planning)
             process_task(store.get_active_task())
             return
 
-    # New task
     task_id = f"task-{user_id}-{int(time.time())}"
     task = Task(task_id=task_id, user_id=user_id, chat_id=chat_id, prompt=text)
     store.add_task(task)
@@ -388,19 +476,6 @@ def handle_message(user_id: int, chat_id: int, text: str):
         process_task(task)
     else:
         send_message(chat_id, "Task queued. It will start when the current task completes.")
-
-
-@app.get("/setwebhook")
-async def set_webhook():
-    service_name = os.getenv("RENDER_SERVICE_NAME", "telegram-coding-agent")
-    url = f"https://{service_name}.onrender.com/webhook/{BOT_TOKEN}"
-    resp = _tg("setWebhook", {"url": url})
-    return JSONResponse(resp)
-
-
-@app.get("/health")
-async def health():
-    return JSONResponse({"status": "ok"})
 
 
 if __name__ == "__main__":

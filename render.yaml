@@ -22,3 +22,7 @@ services:
         value: CodeAgent
       - key: AGENT_EMOJI
         value: true
+      - key: RENDER_API_KEY
+        sync: false
+      - key: RENDER_SERVICE_ID
+        sync: false
